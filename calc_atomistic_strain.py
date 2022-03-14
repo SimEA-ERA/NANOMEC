@@ -9,6 +9,7 @@ from mpi4py import MPI
 import argparse
 import os
 import time
+from neicelllist import NeiCellList, check_same_neis
 
 mpi_comm = None
 mpi_rank = None
@@ -16,34 +17,21 @@ mpi_size = None
 g_check_only = False
 g_at_range = None
 
-def pick_conf_coords(conf):
-    return {'xu': conf['xu'].copy(), 'yu': conf['yu'].copy(), 'zu': conf['zu'].copy()}
-
-@njit()
-def locate_neigbors(ati, xu, yu, zu, boxSize, rcut):
-    n = len(xu)
-    posi = np.array([xu[ati], yu[ati], zu[ati]])
-    neis = []
-    closest_distance = None
-    for atj in range(n):
-        if atj != ati:
-            posj = np.array([xu[atj], yu[atj], zu[atj]])
-            dist = periodicDistance3(posi, posj, boxSize)
-            if dist <= rcut:
-                neis.append(atj)
-                if closest_distance is None or dist < closest_distance:
-                    closest_distance = dist
-    return neis, closest_distance
+def make_nei_cell_list(xs,ys,zs,box_size,rcut):
+    ncl = NeiCellList()
+    ncl.makeCells(box_size[0], box_size[1], box_size[2], rcut)
+    ncl.makeList(xs,ys,zs)
+    return ncl
 
 def calc_dxs(atm, neins, coords, box_size):
-    xu = coords['xu']
-    yu = coords['yu']
-    zu = coords['zu']
-    posm = np.array([xu[atm], yu[atm], zu[atm]])
+    x = coords['x']
+    y = coords['y']
+    z = coords['z']
+    posm = np.array([x[atm], y[atm], z[atm]])
     result = np.zeros((3,len(neins)))
     i = 0
     for nein in neins:
-        posn = np.array([xu[nein], yu[nein], zu[nein]])
+        posn = np.array([x[nein], y[nein], z[nein]])
         dx = periodicDistanceVec(posn,posm,box_size)
         result[:,i] = dx
         i += 1
@@ -52,7 +40,6 @@ def calc_dxs(atm, neins, coords, box_size):
 @njit()
 def obj_func(f,DXS,dxs):
     W = 0.0
-    # print("--->", dxs.shape)
     for i in range(dxs.shape[1]):
         dx0 = dxs[0,i]
         dx1 = dxs[1,i]
@@ -66,7 +53,7 @@ def obj_func(f,DXS,dxs):
         W += (tmp0*tmp0 + tmp1*tmp1 + tmp2*tmp2)
     return W
 
-def calc_strain(startAt, atCount, prevCoords, prevBoxSize, newCoords, newBoxSize, rcut):
+def calc_strain(startAt, atCount, prevCoords, prevBoxOffest, prevBoxSize, newCoords, newBoxSize, rcut):
     global mpi_comm, mpi_rank, g_check_only, g_at_range
     
     minAtCount = mpi_comm.allreduce(atCount, MPI.MIN)
@@ -76,27 +63,32 @@ def calc_strain(startAt, atCount, prevCoords, prevBoxSize, newCoords, newBoxSize
         prevProgressStr = ''
         startTime = time.time()
 
-    xu = prevCoords['xu']
-    yu = prevCoords['yu']
-    zu = prevCoords['zu']
+    x = prevCoords['x'] - prevBoxOffest[0]
+    y = prevCoords['y'] - prevBoxOffest[1]
+    z = prevCoords['z'] - prevBoxOffest[2]
     strains = np.zeros((atCount,3,3), dtype=np.float64)
+    residuals = np.zeros((atCount,), dtype=np.float64) 
+
+    ncl = make_nei_cell_list(x,y,z,prevBoxSize,rcut)
 
     for atm in range(startAt, startAt+atCount):
         at_in_range = g_at_range is None or (atm >= g_at_range[0] and atm <= g_at_range[1])
         if not g_check_only and at_in_range:
-            neis, closestDist = locate_neigbors(atm, xu, yu, zu, prevBoxSize, rcut)
+            neis = ncl.calcNeisOf(atm,x,y,z,rcut)
             DXS = calc_dxs(atm, neis, prevCoords, prevBoxSize)
             dxs = calc_dxs(atm, neis, newCoords, newBoxSize)
             f0 = np.linalg.solve(np.kron(DXS@DXS.T,np.eye(3)),(dxs@DXS.T).flatten()).reshape(3,3)
-            # res0 = obj_func(f0.flatten(),DXS,dxs)
+            res0 = obj_func(f0.flatten(),DXS,dxs)
             # res = scipy.optimize.minimize(obj_func, f0, args=(DXS,dxs), method='BFGS')
             # f = res.x.reshape(3,3)
             e = 0.5 * (np.matmul(f0.transpose(),f0) - np.identity(3))
         else:
             e = np.eye(3) * atm
+            res0 = atm
 
         zeroBasedIndex = atm-startAt 
         strains[zeroBasedIndex,:,:] = e
+        residuals[zeroBasedIndex] = res0
         
         if zeroBasedIndex < minAtCount and zeroBasedIndex % progressSyncSteps == 0:
             mpi_comm.Barrier()
@@ -110,21 +102,7 @@ def calc_strain(startAt, atCount, prevCoords, prevBoxSize, newCoords, newBoxSize
                         print('Done', progressStr, 'time remaining is', time_length_str(timeRemaining))
                         prevProgressStr = progressStr
     
-    return strains
-
-def seek_to_trajectory_step(lammps_reader, target_step):
-    print('Seeking to trajectory step', target_step)
-    while True:
-        conf = lammps_reader.readNextStep()
-        if conf is None:
-            return None
-        step_no = conf['step_no']
-        print('Read conf', step_no)
-        if step_no == target_step:
-            return conf
-        if step_no > target_step:
-            return None         
-
+    return strains, residuals   
 
 def main_function():
     global mpi_comm, mpi_rank, mpi_size, g_check_only, g_at_range
@@ -185,9 +163,10 @@ def main_function():
         start_conf = mpi_comm.bcast(None, root=0)
 
     prevCoords = pick_conf_coords(start_conf)
+    prevBoxOffset = calc_box_offset(start_conf)
     prevBoxSize = calc_box_size(start_conf)
 
-    nats = len(prevCoords['xu'])
+    nats = len(prevCoords['x'])
     nats_per_rank = nats // mpi_size
     nats_per_last_rank = nats_per_rank + nats % mpi_size
 
@@ -203,6 +182,9 @@ def main_function():
 
     data_counts = [at_count*3*3 for at_count in at_counts]
     data_displacements = [at_displacement*3*3 for at_displacement in at_displacements]
+
+    residual_data_counts = [at_count for at_count in at_counts]
+    residual_data_displacements = [at_displacement for at_displacement in at_displacements]
 
     for end_frame in end_frames:
         if mpi_rank == 0:        
@@ -233,30 +215,34 @@ def main_function():
         if mpi_rank == 0:
             startTime = time.time()
 
-        strains = calc_strain(startAt, atCount, prevCoords, prevBoxSize, newCoords, newBoxSize, rcut)
+        strains, residuals = calc_strain(startAt, atCount, prevCoords, prevBoxOffset, prevBoxSize, newCoords, newBoxSize, rcut)
 
         if mpi_rank == 0:
             global_strains = np.zeros((nats,3,3), dtype=np.float64)
+            global_residuals = np.zeros((nats,), dtype=np.float64)
         else:
             global_strains = None 
+            global_residuals = None
 
         mpi_comm.Gatherv(sendbuf=strains, recvbuf=(global_strains, data_counts, data_displacements, MPI.DOUBLE), root=0)
+        mpi_comm.Gatherv(sendbuf=residuals, recvbuf=(global_residuals, residual_data_counts, residual_data_displacements, MPI.DOUBLE), root=0)
 
         if mpi_rank == 0:
             timeElapsed = time.time() - startTime
             print('Calculation took', time_length_str(timeElapsed))
-
 
         if mpi_rank == 0:
             if dest_folder is None: dest_folder = ''
             filename = os.path.join(dest_folder, 'strain_from_%d_to_%d.npy' % (start_frame, end_frame))
             np.save(filename, global_strains)
             print('Saved strain to', filename)
+            # filename = os.path.join(dest_folder, 'residual_from_%d_to_%d.npy' % (start_frame, end_frame))
+            # np.save(filename, global_residuals)
+            # print('Saved residuals to', filename)
 
     if mpi_rank == 0:        
         print('Goodbye')
 
 
 if __name__ == "__main__":
-    # cProfile.run('main_function()', 'stats')
     main_function()

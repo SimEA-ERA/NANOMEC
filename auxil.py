@@ -42,6 +42,13 @@ def calc_box_params(conf):
 
     return result
 
+def calc_box_offset(conf):
+    params = calc_box_params(conf)
+    ofx = params[0,0]
+    ofy = params[1,0]
+    ofz = params[2,0]
+    return np.array([ofx,ofy,ofz])  
+
 def calc_box_size(conf):
     params = calc_box_params(conf)
     lx = params[0,1] - params[0,0]
@@ -95,3 +102,6 @@ def seek_to_trajectory_step(lammps_reader, target_step):
             return conf
         if step_no > target_step:
             return None   
+
+def pick_conf_coords(conf):
+    return {'x': conf['x'].copy(), 'y': conf['y'].copy(), 'z': conf['z'].copy()}            
