@@ -77,7 +77,7 @@ def calc_strain(startAt, atCount, prevCoords, prevBoxOffest, prevBoxSize, newCoo
             neis = ncl.calcNeisOf(atm,x,y,z,rcut)
             DXS = calc_dxs(atm, neis, prevCoords, prevBoxSize)
             dxs = calc_dxs(atm, neis, newCoords, newBoxSize)
-            f0 = np.linalg.solve(np.kron(DXS@DXS.T,np.eye(3)),(dxs@DXS.T).flatten()).reshape(3,3)
+            f0 = np.linalg.solve(np.kron(np.eye(3),DXS@DXS.T),(dxs@DXS.T).flatten()).reshape(3,3)
             res0 = obj_func(f0.flatten(),DXS,dxs)
             # res = scipy.optimize.minimize(obj_func, f0, args=(DXS,dxs), method='BFGS')
             # f = res.x.reshape(3,3)

@@ -1,0 +1,5 @@
+
+*.npy
+*.lammpstrj
+__pycache__
+.ipynb_checkpoints
